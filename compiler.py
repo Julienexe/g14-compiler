@@ -705,29 +705,20 @@ class Parser:
 
 
 # ============================================================
-# PART 4: SEMANTIC ANALYZER
+# PART 4: SEMANTIC ANALYZER 
 # ============================================================
 
 @dataclass
 class SymbolInfo:
-    """Information about a declared symbol."""
     name: str
     kind: str  # 'variable', 'function', 'parameter'
     mutable: bool
     scope: int
     param_count: Optional[int] = None
+    type: Optional[str] = None   # 🔥 NEW
 
 
 class SemanticAnalyzer:
-    """
-    Walks the AST and performs semantic checks:
-      - Undeclared variable usage
-      - Duplicate declarations in same scope
-      - Constant reassignment
-      - Return statement outside function
-      - Wrong number of function arguments
-    """
-
     def __init__(self):
         self.errors: List[str] = []
         self.warnings: List[str] = []
@@ -736,142 +727,238 @@ class SemanticAnalyzer:
         self.scope_level = 0
         self.inside_function = False
 
-    def current_scope(self) -> Dict[str, SymbolInfo]:
+    # ------------------ Scope Handling ------------------
+
+    def current_scope(self):
         return self.scope_stack[-1]
 
-    def lookup(self, name: str) -> Optional[SymbolInfo]:
+    def lookup(self, name):
         for scope in reversed(self.scope_stack):
             if name in scope:
                 return scope[name]
         return None
 
-    def declare(self, name: str, kind: str, mutable: bool = True,
-                param_count: Optional[int] = None) -> None:
+    def declare(self, name, kind, mutable=True, param_count=None):
         scope = self.current_scope()
         if name in scope:
             self.errors.append(f"'{name}' is already declared in this scope")
-        info = SymbolInfo(name=name, kind=kind, mutable=mutable,
-                          scope=self.scope_level, param_count=param_count)
+
+        info = SymbolInfo(
+            name=name,
+            kind=kind,
+            mutable=mutable,
+            scope=self.scope_level,
+            param_count=param_count
+        )
+
         scope[name] = info
         self.all_symbols.append(info)
 
-    def enter_scope(self) -> None:
+    def enter_scope(self):
         self.scope_level += 1
         self.scope_stack.append({})
 
-    def exit_scope(self) -> None:
+    def exit_scope(self):
         self.scope_stack.pop()
         self.scope_level -= 1
 
-    def analyze(self, node: ASTNode) -> None:
-        method_name = f'visit_{type(node).__name__}'
-        getattr(self, method_name, self.generic_visit)(node)
+    # ------------------ Dispatcher ------------------
 
-    def generic_visit(self, node: ASTNode) -> None:
-        pass
+    def analyze(self, node):
+        method = f"visit_{type(node).__name__}"
+        return getattr(self, method, self.generic_visit)(node)
 
-    def visit_Program(self, node: Program) -> None:
+    def generic_visit(self, node):
+        return None
+
+    # ------------------ Program ------------------
+
+    def visit_Program(self, node):
         for stmt in node.body:
             self.analyze(stmt)
 
-    def visit_VarDeclaration(self, node: VarDeclaration) -> None:
+    # ------------------ Literals (TYPE INFERENCE) ------------------
+
+    def visit_NumericLiteral(self, node):
+        node.inferred_type = "int"
+        return "int"
+
+    def visit_StringLiteral(self, node):
+        node.inferred_type = "string"
+        return "string"
+
+    def visit_BooleanLiteral(self, node):
+        node.inferred_type = "bool"
+        return "bool"
+
+    # ------------------ Identifier ------------------
+
+    def visit_Identifier(self, node):
+        sym = self.lookup(node.name)
+        if sym is None:
+            self.errors.append(f"Undeclared variable '{node.name}'")
+            return None
+        node.inferred_type = sym.type
+        return sym.type
+
+    # ------------------ Variable Declaration ------------------
+
+    def visit_VarDeclaration(self, node):
+        var_type = None
+
         if node.init:
-            self.analyze(node.init)
+            var_type = self.analyze(node.init)
+
         self.declare(node.name, 'variable', mutable=(node.kind == 'let'))
 
-    def visit_FuncDeclaration(self, node: FuncDeclaration) -> None:
-        self.declare(node.name, 'function', mutable=False, param_count=len(node.params))
-        prev = self.inside_function
-        self.inside_function = True
-        self.enter_scope()
-        for param in node.params:
-            self.declare(param, 'parameter')
-        self.analyze(node.body)
-        self.exit_scope()
-        self.inside_function = prev
+        sym = self.lookup(node.name)
+        if sym:
+            sym.type = var_type
 
-    def visit_ReturnStmt(self, node: ReturnStmt) -> None:
-        if not self.inside_function:
-            self.errors.append("'return' used outside of a function")
-        if node.argument:
-            self.analyze(node.argument)
+    # ------------------ Assignment ------------------
 
-    def visit_IfStmt(self, node: IfStmt) -> None:
+    def visit_AssignmentExpr(self, node):
+        sym = self.lookup(node.name)
+
+        if sym is None:
+            self.errors.append(f"Cannot assign to undeclared variable '{node.name}'")
+            return None
+
+        if not sym.mutable:
+            self.errors.append(f"Cannot reassign constant '{node.name}'")
+
+        value_type = self.analyze(node.value)
+
+        if sym.type and value_type and sym.type != value_type:
+            self.errors.append(
+                f"Type mismatch: cannot assign {value_type} to {sym.type}"
+            )
+
+        return sym.type
+
+    # ------------------ Binary Expressions ------------------
+
+    def visit_BinaryExpr(self, node):
+        left_type = self.analyze(node.left)
+        right_type = self.analyze(node.right)
+
+        # Arithmetic
+        if node.operator in ['+', '-', '*', '/', '%']:
+            if left_type == right_type == "int":
+                node.inferred_type = "int"
+                return "int"
+            else:
+                self.errors.append("Invalid arithmetic operation")
+                return None
+
+        # Relational
+        if node.operator in ['>', '<', '>=', '<=']:
+            node.inferred_type = "bool"
+            return "bool"
+
+        # Equality
+        if node.operator in ['==', '!=']:
+            node.inferred_type = "bool"
+            return "bool"
+
+        # Logical
+        if node.operator in ['&&', '||']:
+            node.inferred_type = "bool"
+            return "bool"
+
+        return None
+
+    # ------------------ Unary ------------------
+
+    def visit_UnaryExpr(self, node):
+        return self.analyze(node.operand)
+
+    # ------------------ Statements ------------------
+
+    def visit_ExprStmt(self, node):
+        self.analyze(node.expression)
+
+    def visit_PrintStmt(self, node):
+        self.analyze(node.argument)
+
+    def visit_BlockStmt(self, node):
+        for stmt in node.body:
+            self.analyze(stmt)
+
+    def visit_IfStmt(self, node):
         self.analyze(node.test)
+
         self.enter_scope()
         self.analyze(node.consequent)
         self.exit_scope()
+
         if node.alternate:
             self.enter_scope()
             self.analyze(node.alternate)
             self.exit_scope()
 
-    def visit_WhileStmt(self, node: WhileStmt) -> None:
+    def visit_WhileStmt(self, node):
         self.analyze(node.test)
         self.enter_scope()
         self.analyze(node.body)
         self.exit_scope()
 
-    def visit_ForStmt(self, node: ForStmt) -> None:
+    def visit_ForStmt(self, node):
         self.enter_scope()
+
         if node.init:
             self.analyze(node.init)
         if node.test:
             self.analyze(node.test)
         if node.update:
             self.analyze(node.update)
+
         self.analyze(node.body)
         self.exit_scope()
 
-    def visit_BlockStmt(self, node: BlockStmt) -> None:
-        for stmt in node.body:
-            self.analyze(stmt)
+    def visit_ReturnStmt(self, node):
+        if not self.inside_function:
+            self.errors.append("'return' used outside of a function")
 
-    def visit_PrintStmt(self, node: PrintStmt) -> None:
-        self.analyze(node.argument)
+        if node.argument:
+            self.analyze(node.argument)
 
-    def visit_ExprStmt(self, node: ExprStmt) -> None:
-        self.analyze(node.expression)
+    def visit_FuncDeclaration(self, node):
+        self.declare(node.name, 'function', mutable=False, param_count=len(node.params))
 
-    def visit_BinaryExpr(self, node: BinaryExpr) -> None:
-        self.analyze(node.left)
-        self.analyze(node.right)
+        prev = self.inside_function
+        self.inside_function = True
 
-    def visit_UnaryExpr(self, node: UnaryExpr) -> None:
-        self.analyze(node.operand)
+        self.enter_scope()
+        for param in node.params:
+            self.declare(param, 'parameter')
 
-    def visit_AssignmentExpr(self, node: AssignmentExpr) -> None:
-        sym = self.lookup(node.name)
-        if sym is None:
-            self.errors.append(f"Cannot assign to undeclared variable '{node.name}'")
-        elif not sym.mutable:
-            self.errors.append(f"Cannot reassign constant '{node.name}'")
-        self.analyze(node.value)
+        self.analyze(node.body)
 
-    def visit_CallExpr(self, node: CallExpr) -> None:
+        self.exit_scope()
+        self.inside_function = prev
+
+    def visit_CallExpr(self, node):
         self.analyze(node.callee)
+
         for arg in node.arguments:
             self.analyze(arg)
+
         if isinstance(node.callee, Identifier):
             sym = self.lookup(node.callee.name)
             if sym and sym.kind == 'function' and sym.param_count is not None:
                 if len(node.arguments) != sym.param_count:
                     self.warnings.append(
-                        f"'{node.callee.name}' expects {sym.param_count} "
-                        f"argument(s) but got {len(node.arguments)}"
+                        f"'{node.callee.name}' expects {sym.param_count} argument(s) but got {len(node.arguments)}"
                     )
 
-    def visit_MemberExpr(self, node: MemberExpr) -> None:
-        self.analyze(node.obj)
-        self.analyze(node.prop)
-
-    def visit_Identifier(self, node: Identifier) -> None:
-        if node.name != "<error>" and self.lookup(node.name) is None:
-            self.errors.append(f"Undeclared variable '{node.name}'")
-
-    def visit_ArrayExpr(self, node: ArrayExpr) -> None:
+    def visit_ArrayExpr(self, node):
         for el in node.elements:
             self.analyze(el)
+
+    def visit_MemberExpr(self, node):
+        self.analyze(node.obj)
+        self.analyze(node.prop)
 
 
 # ============================================================
